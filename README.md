@@ -58,6 +58,12 @@ Increase generation timeout for slower local inference (CPU / large model):
 python rename_doc_ai.py "*.pdf" --request-timeout 600
 ```
 
+Show live inference progress in console:
+
+```powershell
+python rename_doc_ai.py "*.pdf" --show-progress
+```
+
 Keep auto-started Ollama running after the script exits:
 
 ```powershell
@@ -88,3 +94,4 @@ Windows shell behavior:
 - If the generated name already exists, it appends `_2`, `_3`, etc.
 - Nothing is uploaded to cloud services by this script.
 - If you get generation timeouts, increase `--request-timeout` and/or reduce `--max-pages` and `--max-chars`.
+- `--show-progress` enables streaming requests and prints token progress while Ollama generates.

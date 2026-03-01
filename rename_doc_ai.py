@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import glob
 import json
+import os
 import re
 import subprocess
 import sys
@@ -39,6 +40,9 @@ def extract_text_from_pdf(path: Path, max_pages: int, max_chars: int) -> str:
                 page_text = page_text[:remaining]
             chunks.append(page_text)
             total += len(page_text)
+
+        print(f"Extracted {len(chunks)}/{len(doc)} page(s) with {total} chars. Remaining chars: {max(0, max_chars - total)}")
+
     return "\n\n".join(chunks).strip()
 
 
@@ -63,33 +67,60 @@ def extract_text(path: Path, max_pages: int, max_chars: int) -> str:
 
 def build_prompt(document_text: str, original_name: str) -> str:
     return f"""
-You create precise, human-friendly file names for documents.
+You create precise, human-friendly and sorting-friendly file names for documents.
 Return only one filename stem (no file extension), no quotes, no markdown.
-Use this format when possible: YYYY-MM-DD_topic_or_title_optional_source
+Focus on extraction of the date of the document with priority.
+Use this template for filenames: "YYYY-MM-DD_<topic_or_title_company_name>". Don't forget the "-" between date parts.
+For easy sorting, its very important to have the date in the beginning of the filename and following a strict format.
 Rules:
-- Keep it short and specific.
-- Use lowercase snake_case.
-- Include date only if clearly present in the text.
+- Keep the topic and source short and specific.
 - Avoid generic words like document/file/scan/new.
 - Do not invent facts.
+- Look for dates in the text, especially near the beginning. Use them in the filename.
 
+Language of the document is likely German, but it can be in English or other European languages as well.
+Consider that depending on the Language the date can be in different formats.
+E.g.:
+- "12.03.2020"
+- "12.03.20"
+- "2020-03-12"
+- "12. März 2020"
+- "Per 31. Dezember 2025"
+- "Am 1.1.2024"
+- "St. Gallen, 1. Januar 2026"
+- "Ort und Datum Lausanne, 16. Februar 2026"
+
+The original filename may contain the date of scanning the document in this format: "YYYYMMDD_HHMMSS_<scan-number>".
+The scanning data is usually close to the document date, but not always correct. Use it as a hint, but prioritize dates found in the document text.
 Original filename: {original_name}
 
 Document content:
+========================
 {document_text}
 """.strip()
 
 
-def query_ollama(prompt: str, model: str, host: str, timeout_sec: int = 120) -> str:
+def query_ollama(
+    prompt: str,
+    model: str,
+    host: str,
+    timeout_sec: int = 120,
+    show_progress: bool = False,
+) -> str:
     url = host.rstrip("/") + "/api/generate"
     payload = {
         "model": model,
         "prompt": prompt,
-        "stream": False,
+        "stream": show_progress,
         "options": {"temperature": 0.1},
     }
     try:
-        response = requests.post(url, json=payload, timeout=timeout_sec)
+        response = requests.post(
+            url,
+            json=payload,
+            timeout=timeout_sec,
+            stream=show_progress,
+        )
         response.raise_for_status()
     except requests.ReadTimeout as exc:
         raise RuntimeError(
@@ -104,6 +135,55 @@ def query_ollama(prompt: str, model: str, host: str, timeout_sec: int = 120) -> 
             f"Host: {host}\n"
             f"Original error: {exc}"
         ) from exc
+
+    if show_progress:
+        output_parts: list[str] = []
+        last_report_time = 0.0
+        final_stats: dict[str, int] = {}
+        try:
+            for raw_line in response.iter_lines(decode_unicode=True):
+                if not raw_line:
+                    continue
+                try:
+                    event = json.loads(raw_line)
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError("Ollama returned invalid streaming JSON.") from exc
+
+                chunk = str(event.get("response", ""))
+                if chunk:
+                    output_parts.append(chunk)
+
+                now = time.time()
+                if now - last_report_time >= 0.5:
+                    eval_count = event.get("eval_count")
+                    if isinstance(eval_count, int) and eval_count >= 0:
+                        print(f"\rInference progress: {eval_count} tokens", end="", flush=True)
+                        last_report_time = now
+
+                if event.get("done"):
+                    for key in ("prompt_eval_count", "eval_count", "total_duration"):
+                        value = event.get(key)
+                        if isinstance(value, int):
+                            final_stats[key] = value
+                    break
+        finally:
+            response.close()
+
+        print()
+        text = "".join(output_parts).strip()
+        if not text:
+            raise RuntimeError("Ollama returned an empty response.")
+
+        eval_count = final_stats.get("eval_count")
+        total_duration_ns = final_stats.get("total_duration")
+        if eval_count is not None and total_duration_ns and total_duration_ns > 0:
+            seconds = total_duration_ns / 1_000_000_000
+            rate = eval_count / seconds if seconds > 0 else 0.0
+            print(f"Inference done: {eval_count} tokens in {seconds:.1f}s ({rate:.1f} tok/s)")
+        elif eval_count is not None:
+            print(f"Inference done: {eval_count} tokens")
+
+        return text.splitlines()[0].strip()
 
     try:
         data = response.json()
@@ -131,12 +211,16 @@ def ollama_is_healthy(host: str, timeout_sec: int = 2) -> bool:
 
 
 def start_ollama_serve() -> subprocess.Popen:
+    print("Starting `ollama serve`...")
+    env = os.environ.copy()
+    env["OLLAMA_VULKAN"] = "1"
     try:
         return subprocess.Popen(  # noqa: S603
             ["ollama", "serve"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             stdin=subprocess.DEVNULL,
+            env=env,
         )
     except FileNotFoundError as exc:
         raise RuntimeError(
@@ -253,14 +337,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-pages",
         type=int,
-        default=8,
-        help="Maximum PDF pages to read (default: 8).",
+        default=2,
+        help="Maximum PDF pages to read (default: 2).",
     )
     parser.add_argument(
         "--max-chars",
         type=int,
-        default=16000,
-        help="Maximum characters extracted from document (default: 16000).",
+        default=5000,
+        help="Maximum characters extracted from document (default: 5000).",
     )
     parser.add_argument(
         "--auto-start-ollama",
@@ -281,8 +365,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--request-timeout",
         type=int,
-        default=120,
-        help="Seconds to wait for each Ollama generation request (default: 120).",
+        default=600,
+        help="Seconds to wait for each Ollama generation request (default: 600).",
+    )
+    parser.add_argument(
+        "--show-progress",
+        action="store_true",
+        help="Show live Ollama inference progress while generating a filename.",
     )
     return parser.parse_args()
 
@@ -347,6 +436,7 @@ def main() -> int:
                     model=args.model,
                     host=args.host,
                     timeout_sec=max(5, args.request_timeout),
+                    show_progress=args.show_progress,
                 )
                 safe_stem = sanitize_stem(raw_name, fallback=input_path.stem)
                 target = unique_target_path(input_path, safe_stem)
