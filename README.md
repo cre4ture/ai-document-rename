@@ -26,6 +26,8 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
+You might need to run `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` to allow *.ps1 script execution temporarily.
+
 ## 3) Usage
 
 Preview suggested name only:
