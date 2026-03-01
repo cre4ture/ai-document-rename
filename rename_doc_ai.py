@@ -3,12 +3,13 @@
 Generate a good document filename with a local offline LLM, optionally rename file.
 
 Example:
-  python rename_doc_ai.py "C:\\docs\\scan.pdf" --rename
+  python rename_doc_ai.py "C:\\docs\\scan1.pdf" "C:\\docs\\scan2.pdf" --rename
 """
 
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import re
 import subprocess
@@ -90,6 +91,13 @@ def query_ollama(prompt: str, model: str, host: str, timeout_sec: int = 120) -> 
     try:
         response = requests.post(url, json=payload, timeout=timeout_sec)
         response.raise_for_status()
+    except requests.ReadTimeout as exc:
+        raise RuntimeError(
+            "Ollama request timed out while generating a response.\n"
+            f"Host: {host}\n"
+            f"Timeout: {timeout_sec}s\n"
+            "Try increasing --request-timeout, using a smaller/faster model, or reducing --max-pages/--max-chars."
+        ) from exc
     except requests.RequestException as exc:
         raise RuntimeError(
             "Could not reach local Ollama server. Is it running?\n"
@@ -188,11 +196,45 @@ def unique_target_path(original: Path, new_stem: str) -> Path:
         n += 1
 
 
+def expand_input_files(raw_inputs: list[Path]) -> tuple[list[Path], int]:
+    expanded: list[Path] = []
+    seen: set[Path] = set()
+    unmatched_patterns = 0
+
+    for raw in raw_inputs:
+        raw_str = str(raw)
+        if glob.has_magic(raw_str):
+            matches = [Path(p).expanduser().resolve() for p in glob.glob(raw_str, recursive=True)]
+            if not matches:
+                print(f"Error: Input pattern matched no files: {raw}", file=sys.stderr)
+                unmatched_patterns += 1
+                continue
+            for match in matches:
+                if match in seen:
+                    continue
+                seen.add(match)
+                expanded.append(match)
+            continue
+
+        resolved = raw.expanduser().resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        expanded.append(resolved)
+
+    return expanded, unmatched_patterns
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate a proper document name with an offline local AI model."
     )
-    parser.add_argument("input_file", type=Path, help="Path to the input document.")
+    parser.add_argument(
+        "input_files",
+        type=Path,
+        nargs="+",
+        help="One or more input paths or glob patterns (e.g. \"*.pdf\", \"**/*.pdf\").",
+    )
     parser.add_argument(
         "--model",
         default="qwen2.5:14b-instruct",
@@ -236,22 +278,37 @@ def parse_args() -> argparse.Namespace:
         default=30,
         help="Seconds to wait for auto-started Ollama to become ready (default: 30).",
     )
+    parser.add_argument(
+        "--request-timeout",
+        type=int,
+        default=120,
+        help="Seconds to wait for each Ollama generation request (default: 120).",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    input_path: Path = args.input_file.expanduser().resolve()
+    input_paths, unmatched_patterns = expand_input_files(args.input_files)
     started_ollama_proc: subprocess.Popen | None = None
 
-    if not input_path.exists():
-        print(f"Error: File not found: {input_path}", file=sys.stderr)
-        return 1
-    if not input_path.is_file():
-        print(f"Error: Not a file: {input_path}", file=sys.stderr)
-        return 1
-
     try:
+        valid_input_paths: list[Path] = []
+        invalid_inputs = unmatched_patterns
+        for path in input_paths:
+            if not path.exists():
+                print(f"Error: File not found: {path}", file=sys.stderr)
+                invalid_inputs += 1
+                continue
+            if not path.is_file():
+                print(f"Error: Not a file: {path}", file=sys.stderr)
+                invalid_inputs += 1
+                continue
+            valid_input_paths.append(path)
+
+        if not valid_input_paths:
+            return 1
+
         if args.auto_start_ollama and not ollama_is_healthy(args.host):
             if not is_local_ollama_host(args.host):
                 raise RuntimeError(
@@ -266,18 +323,65 @@ def main() -> int:
                 )
             print("Ollama is ready.")
 
-        text = extract_text(
-            input_path,
-            max_pages=max(1, args.max_pages),
-            max_chars=max(1000, args.max_chars),
-        )
-        if not text:
-            raise RuntimeError("No readable text found in document.")
+        if not ollama_is_healthy(args.host):
+            raise RuntimeError(
+                "Could not reach Ollama server. Start it manually or use --auto-start-ollama."
+            )
 
-        prompt = build_prompt(text, input_path.stem)
-        raw_name = query_ollama(prompt, model=args.model, host=args.host)
-        safe_stem = sanitize_stem(raw_name, fallback=input_path.stem)
-        target = unique_target_path(input_path, safe_stem)
+        processed_ok = 0
+        process_failures = 0
+        for input_path in valid_input_paths:
+            print(f"\nProcessing: {input_path.name}")
+            try:
+                text = extract_text(
+                    input_path,
+                    max_pages=max(1, args.max_pages),
+                    max_chars=max(1000, args.max_chars),
+                )
+                if not text:
+                    raise RuntimeError("No readable text found in document.")
+
+                prompt = build_prompt(text, input_path.stem)
+                raw_name = query_ollama(
+                    prompt,
+                    model=args.model,
+                    host=args.host,
+                    timeout_sec=max(5, args.request_timeout),
+                )
+                safe_stem = sanitize_stem(raw_name, fallback=input_path.stem)
+                target = unique_target_path(input_path, safe_stem)
+
+                print(f"Suggested name: {target.name}")
+                if not args.rename:
+                    processed_ok += 1
+                    continue
+
+                try:
+                    input_path.rename(target)
+                except OSError as exc:
+                    raise RuntimeError(f"Rename failed: {exc}") from exc
+
+                print(f"Renamed:\n  {input_path.name}\n  -> {target.name}")
+                processed_ok += 1
+            except Exception as exc:
+                process_failures += 1
+                print(f"Error [{input_path.name}]: {exc}", file=sys.stderr)
+                continue
+
+        if not args.rename:
+            print("\nPreview mode only. Re-run with --rename to apply.")
+
+        total_failures = invalid_inputs + process_failures
+        if total_failures > 0:
+            print(
+                f"\nCompleted with errors: {processed_ok} succeeded, "
+                f"{process_failures} processing failed, {invalid_inputs} invalid input.",
+                file=sys.stderr,
+            )
+            return 4
+
+        print(f"\nCompleted successfully: {processed_ok} file(s).")
+        return 0
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
@@ -285,20 +389,6 @@ def main() -> int:
         if started_ollama_proc and not args.keep_ollama_running:
             print("Stopping auto-started Ollama process...")
             stop_ollama_process(started_ollama_proc)
-
-    print(f"Suggested name: {target.name}")
-    if not args.rename:
-        print("Preview mode only. Re-run with --rename to apply.")
-        return 0
-
-    try:
-        input_path.rename(target)
-    except OSError as exc:
-        print(f"Rename failed: {exc}", file=sys.stderr)
-        return 3
-
-    print(f"Renamed:\n  {input_path.name}\n  -> {target.name}")
-    return 0
 
 
 if __name__ == "__main__":
